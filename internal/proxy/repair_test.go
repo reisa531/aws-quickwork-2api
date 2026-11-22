@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http/httptest"
 	"path/filepath"
@@ -65,5 +66,22 @@ func TestCompleteJSONWithoutFinalMarker(t *testing.T) {
 	text, calls, err := resolveToolCalls(ChatResult{Text: draft}, map[string]bool{"lookup": true}, "auto", "", true)
 	if err != nil || text != "" || len(calls) != 1 || calls[0].Function.Arguments != `{"key":"A"}` {
 		t.Fatalf("%q %+v %v", text, calls, err)
+	}
+}
+
+func TestRepairLiteralArgument(t *testing.T) {
+	const command = " for f in *.md; do echo \"$f\"; done\ngrep '\\s' \"$f\"\n"
+	body := "CLIENT_TOOL_TEXT\n" + `{"name":"bash","text_argument":"command","arguments":{"workdir":"/tmp"}}` + "\n" + command + "\nEND_CLIENT_TOOL_TEXT"
+	_, calls, err := repairedToolCalls(ChatResult{Text: body}, map[string]bool{"bash": true}, "auto", "", false)
+	if err != nil || len(calls) != 1 {
+		t.Fatal(err, calls)
+	}
+	var args struct{ Command, Workdir string }
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil || args.Command != command || args.Workdir != "/tmp" {
+		t.Fatal(args, err)
+	}
+	_, _, err = repairedToolCalls(ChatResult{Text: body}, map[string]bool{"read": true}, "auto", "", false)
+	if err == nil {
+		t.Fatal("accepted undeclared tool")
 	}
 }

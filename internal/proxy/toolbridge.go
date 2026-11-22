@@ -273,3 +273,36 @@ func resolveToolCalls(res ChatResult, allowed map[string]bool, mode, name string
 	}
 	return text, replyToolCalls(replies), nil
 }
+
+// A format-repair response can put one long string argument after a JSON
+// header. Commands and file contents then need no additional escaping.
+const rawArgumentRepair = `For a single call containing a command or file contents, use this exact alternative:
+CLIENT_TOOL_TEXT
+{"name":"actual tool name","text_argument":"actual string parameter name","arguments":{"other_parameter":"other value"}}
+literal text parameter value, with original quotes and line breaks
+END_CLIENT_TOOL_TEXT
+The header occupies one line. Put all remaining parameters in arguments. Output nothing else. For multiple calls, use the normal protocol.`
+
+func repairedToolCalls(res ChatResult, allowed map[string]bool, mode, name string, parallel bool) (string, []ToolCall, error) {
+	body, raw := strings.CutPrefix(strings.TrimSpace(res.Text), "CLIENT_TOOL_TEXT\n")
+	if !raw {
+		return resolveToolCalls(res, allowed, mode, name, parallel)
+	}
+	header, body, ok := strings.Cut(body, "\n")
+	value, closed := strings.CutSuffix(body, "\nEND_CLIENT_TOOL_TEXT")
+	var call struct {
+		Name  string                     `json:"name"`
+		Field string                     `json:"text_argument"`
+		Args  map[string]json.RawMessage `json:"arguments"`
+	}
+	if !ok || !closed || json.Unmarshal([]byte(header), &call) != nil || !allowed[call.Name] || call.Field == "" || call.Args == nil || call.Args[call.Field] != nil {
+		return "", nil, errToolMarker
+	}
+	call.Args[call.Field], _ = json.Marshal(value)
+	args, err := json.Marshal(call.Args)
+	if err != nil {
+		return "", nil, err
+	}
+	replies := repliesFromEnvelopes([]toolCallEnvelope{{Name: call.Name, Arguments: args}}, allowed)
+	return "", replyToolCalls(replies), nil
+}

@@ -261,7 +261,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		repair := ChatInput{
 			Model: model, Title: "Format client tool call",
 			SystemPrompt: systemPromptText + "\n\nReformat the supplied draft as client tool calls. Preserve the intended arguments. If a required value is missing and cannot be recovered, report failure. Do not execute the task.",
-			Prompt:       bridgePrompt + "\n\nReturn the corrected tool call(s) for this rejected draft. Keep the original tool and all parameter values. Use the declared tool names and complete JSON object arguments.\n" + res.Text,
+			Prompt:       bridgePrompt + "\n\nReturn the corrected tool call(s) for this rejected draft. Keep the original tool and all parameter values. Use the declared tool names and complete JSON object arguments.\n" + rawArgumentRepair + "\n\nRejected draft:\n" + res.Text,
 		}
 		fixed, repairErr := s.chat(ctx, sess, repair, nil)
 		if repairErr != nil {
@@ -269,7 +269,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		res.Usage.add(fixed.Usage)
-		text, calls, err = resolveToolCalls(fixed, bridgeAllowed, choiceMode, choiceName, parallelTools)
+		text, calls, err = repairedToolCalls(fixed, bridgeAllowed, choiceMode, choiceName, parallelTools)
 		if err == nil && len(calls) == 0 {
 			err = fmt.Errorf("%w: repair produced no tool call", errToolMarker)
 		}
