@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -20,6 +21,10 @@ type toolDefinition struct {
 }
 
 type toolCallEnvelope struct {
+	Function *struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
 }
@@ -49,7 +54,7 @@ func collectToolDefinitions(tools []Tool, functions []ToolFunction) []toolDefini
 
 // buildToolBridgePrompt teaches the upstream model a small text protocol for
 // tools that only the caller can execute. QuickWork does not accept arbitrary
-// client tool schemas, so the proxy has to carry them in the system prompt.
+// client tool schemas, so the proxy has to carry them in the turn.
 func buildToolBridgePrompt(tools []Tool, functions []ToolFunction, mode, name string, parallel bool) string {
 	if mode == "none" {
 		return ""
@@ -58,7 +63,7 @@ func buildToolBridgePrompt(tools []Tool, functions []ToolFunction, mode, name st
 	if len(defs) == 0 {
 		return ""
 	}
-	body, err := json.MarshalIndent(defs, "", "  ")
+	body, err := json.Marshal(defs)
 	if err != nil {
 		return ""
 	}
@@ -67,10 +72,9 @@ func buildToolBridgePrompt(tools []Tool, functions []ToolFunction, mode, name st
 	b.WriteString("<client_tool_protocol>\n")
 	b.WriteString("The caller exposes these client tools:\n")
 	b.Write(body)
-	b.WriteString("\n\nBackend capability notice: this backend does not expose a native function-calling channel. Any earlier instruction that assumes native tool calls (for example, \"use the native tool API\" or \"do not output tool calls as text\") cannot be satisfied here. For the client tools listed above, the marker format below is the only supported mechanism. Keep all other instructions unchanged.\n")
-	b.WriteString("To call a tool, output exactly one marker per call and no other text in that message:\n")
+	b.WriteString("\nWhen a listed tool is needed, request it from the client using the following wire format. The proxy converts this marker into a native tool call for the client. The client runs the tool in its own environment. Use the client tool for its advertised task, including lookups of client data. Output one marker per invocation, with the exact tool name and a JSON object matching its parameters:\n")
 	b.WriteString(`<client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>`)
-	b.WriteString("\nThe caller executes the tool and returns a tool result. After receiving it, continue the task. Do not wrap a tool call in Markdown fences. Do not add prose around a tool call.\n")
+	b.WriteString("\nUse valid JSON string escaping for commands (for example, write \\\\s for a literal backslash followed by s). End the turn after the marker(s) and wait for the client. If the transcript contains a tool result, use that result to continue. When the task is complete, answer normally.\n")
 	if mode == "function" && name != "" {
 		fmt.Fprintf(&b, "You must call the tool %q.\n", name)
 	}
@@ -109,13 +113,16 @@ func parseToolEnvelopes(payload string) []toolCallEnvelope {
 func repliesFromEnvelopes(envelopes []toolCallEnvelope, allowed map[string]bool) []ToolCallReply {
 	out := make([]ToolCallReply, 0, len(envelopes))
 	for _, env := range envelopes {
+		if env.Function != nil && env.Name == "" && env.Arguments == nil {
+			env.Name, env.Arguments = env.Function.Name, env.Function.Arguments
+		}
 		name := strings.TrimSpace(env.Name)
 		if name == "" || !allowed[name] {
 			continue
 		}
 		args := argumentString(env.Arguments)
-		if strings.TrimSpace(args) == "" {
-			args = "{}"
+		if !strings.HasPrefix(strings.TrimSpace(args), "{") || !json.Valid([]byte(args)) {
+			continue
 		}
 		out = append(out, ToolCallReply{
 			ID:        "call_" + strings.ReplaceAll(uuid(), "-", ""),
@@ -126,36 +133,87 @@ func repliesFromEnvelopes(envelopes []toolCallEnvelope, allowed map[string]bool)
 	return out
 }
 
-// extractToolCalls removes valid client tool-call markers from text and
-// returns the remaining assistant text. Unknown tool names are left untouched.
-func extractToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
-	if len(allowed) == 0 {
-		return text, nil
+// Model-written commands sometimes contain literal line breaks or regex
+// escapes such as \s. Quote only bytes that JSON cannot already decode.
+func quoteInvalidStringEscapes(payload string) string {
+	var out strings.Builder
+	inString := false
+	for i := 0; i < len(payload); i++ {
+		c := payload[i]
+		switch {
+		case c == '"':
+			inString = !inString
+		case inString && c == '\\' && i+1 < len(payload):
+			next := payload[i+1]
+			out.WriteByte('\\')
+			if strings.ContainsRune(`"\/bfnrtu`, rune(next)) {
+				i++
+				out.WriteByte(next)
+				continue
+			}
+		case inString && c < 0x20:
+			fmt.Fprintf(&out, `\u%04x`, c)
+			continue
+		}
+		out.WriteByte(c)
 	}
+	return out.String()
+}
+
+var errToolMarker = errors.New("upstream returned an incomplete or invalid client tool call")
+
+// Read one complete JSON value before looking for its closing marker. A
+// command can itself contain the literal marker, for example in a file edit.
+func markedToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply, error) {
 	var clean strings.Builder
 	var replies []ToolCallReply
-	rest := text
 	for {
-		start := strings.Index(rest, clientToolCallOpen)
-		if start < 0 {
-			clean.WriteString(rest)
+		before, rest, found := strings.Cut(text, clientToolCallOpen)
+		clean.WriteString(before)
+		if !found {
 			break
 		}
-		end := strings.Index(rest[start+len(clientToolCallOpen):], clientToolCallClose)
-		if end < 0 {
-			clean.WriteString(rest)
-			break
+		trimmed := strings.TrimLeft(rest, " \t\r\n")
+		if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+			clean.WriteString(clientToolCallOpen)
+			text = rest
+			continue
 		}
-		end += start + len(clientToolCallOpen)
-		clean.WriteString(rest[:start])
-		payload := rest[start+len(clientToolCallOpen) : end]
-		replies = append(replies, repliesFromEnvelopes(parseToolEnvelopes(payload), allowed)...)
-		rest = rest[end+len(clientToolCallClose):]
+		rest = trimmed
+		dec := json.NewDecoder(strings.NewReader(rest))
+		var raw json.RawMessage
+		var payload, after string
+		if err := dec.Decode(&raw); err == nil {
+			payload = string(raw)
+			tail := strings.TrimLeft(rest[dec.InputOffset():], " \t\r\n")
+			if tail == "" {
+				// The JSON value is complete and only its final tag is missing.
+				after, found = "", true
+			} else {
+				after, found = strings.CutPrefix(tail, clientToolCallClose)
+			}
+		} else {
+			payload, after, found = strings.Cut(rest, clientToolCallClose)
+			payload = quoteInvalidStringEscapes(payload)
+		}
+		if !found {
+			return "", nil, fmt.Errorf("%w: missing closing marker", errToolMarker)
+		}
+		envelopes := parseToolEnvelopes(payload)
+		if len(envelopes) == 0 {
+			return "", nil, fmt.Errorf("%w: could not decode call JSON", errToolMarker)
+		}
+		calls := repliesFromEnvelopes(envelopes, allowed)
+		if len(calls) == 0 || len(calls) != len(envelopes) {
+			return "", nil, fmt.Errorf("%w: tool name or arguments do not match the client protocol", errToolMarker)
+		}
+		replies = append(replies, calls...)
+		text = after
 	}
 	if len(replies) == 0 {
-		return text, nil
+		return clean.String(), nil, nil
 	}
-	return strings.TrimSpace(clean.String()), replies
+	return strings.TrimSpace(clean.String()), replies, nil
 }
 
 // extractBareToolCall handles models that answer with a single JSON object
@@ -181,14 +239,6 @@ func extractBareToolCall(text string, allowed map[string]bool) (string, []ToolCa
 	return "", replies
 }
 
-func parseClientToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
-	clean, replies := extractToolCalls(text, allowed)
-	if len(replies) > 0 {
-		return clean, replies
-	}
-	return extractBareToolCall(text, allowed)
-}
-
 func replyToolCalls(replies []ToolCallReply) []ToolCall {
 	out := make([]ToolCall, 0, len(replies))
 	for _, r := range replies {
@@ -202,4 +252,24 @@ func replyToolCalls(replies []ToolCallReply) []ToolCall {
 		})
 	}
 	return out
+}
+
+func resolveToolCalls(res ChatResult, allowed map[string]bool, mode, name string, parallel bool) (string, []ToolCall, error) {
+	if mode == "none" || len(allowed) == 0 {
+		return res.Text, nil, nil
+	}
+	text, replies, err := markedToolCalls(res.Text, allowed)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(replies) == 0 {
+		text, replies = extractBareToolCall(text, allowed)
+	}
+	if len(replies) == 0 {
+		return text, filterToolCalls(res.ToolCalls, allowed, mode, name, parallel), nil
+	}
+	if !parallel {
+		replies = replies[:1]
+	}
+	return text, replyToolCalls(replies), nil
 }

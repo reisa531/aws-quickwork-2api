@@ -18,7 +18,7 @@ type Server struct {
 	cfg      *config.Config
 	accounts *accounts.Manager
 	tokens   *APIKeyAuth
-	upstream *Upstream
+	chat     func(context.Context, *Session, ChatInput, EventFunc) (ChatResult, error)
 }
 
 func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
@@ -26,7 +26,7 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 		cfg:      cfg,
 		accounts: mgr,
 		tokens:   NewAPIKeyAuth(cfg.APIKeys),
-		upstream: NewUpstream(cfg),
+		chat:     NewUpstream(cfg).Chat,
 	}
 }
 
@@ -107,8 +107,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	model := s.mapModel(req.Model)
 	allowedTools := requestedToolNames(&req)
 	choiceMode, choiceName := parseToolChoice(req.ToolChoice)
-	if choiceMode == "function" && choiceName != "" {
-		allowedTools[choiceName] = true
+	if choiceMode == "function" && !allowedTools[choiceName] {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tool_choice names an undeclared tool")
+		return
 	}
 	parallelTools := true
 	if req.ParallelToolCalls != nil {
@@ -117,7 +118,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	bridgePrompt := buildToolBridgePrompt(req.Tools, req.Functions, choiceMode, choiceName, parallelTools)
 	bridgeActive := bridgePrompt != ""
 	if bridgeActive {
-		systemPromptText += "\n\n" + bridgePrompt
+		// Smart can consult its own workspace when the client catalog appears
+		// only in system_prompt. Carry the catalog with the actual turn.
+		systemPromptText += "\n\nThe client tool catalog and its wire format appear at the start of this turn. Use that protocol to send tool calls to the client through this relay."
+		prompt = bridgePrompt + "\n\n" + prompt
 	}
 	bridgeAllowed := allowedTools
 	if choiceMode == "function" && choiceName != "" {
@@ -138,86 +142,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		SystemPrompt: systemPromptText,
 	}
 
-	if !req.Stream {
-		var res ChatResult
-		var lastErr error
-		for range s.maxAttempts(ctx) {
-			acct, err := s.accounts.Next(ctx)
-			if err != nil {
-				lastErr = err
-				break
-			}
-			sess := SessionFromAccount(acct, s.cfg)
-			if err := sess.validate(); err != nil {
-				s.accounts.ReportFailure(ctx, acct.ID, err)
-				lastErr = err
-				continue
-			}
-			res, err = s.upstream.Chat(ctx, sess, in, nil)
-			if err == nil {
-				lastErr = nil
-				break
-			}
-			lastErr = err
-			s.accounts.ReportFailure(ctx, acct.ID, err)
-			if ctx.Err() != nil {
-				break
-			}
-		}
-		if lastErr != nil {
-			status, code := http.StatusBadGateway, "upstream_error"
-			if errors.Is(lastErr, accounts.ErrNoAccounts) {
-				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
-			}
-			writeOpenAIError(w, status, code, lastErr.Error())
-			return
-		}
-		text := res.Text
-		var bridgeReplies []ToolCallReply
-		if bridgeActive {
-			text, bridgeReplies = parseClientToolCalls(text, bridgeAllowed)
-			if !parallelTools && len(bridgeReplies) > 1 {
-				bridgeReplies = bridgeReplies[:1]
-			}
-		}
-		toolCalls := replyToolCalls(bridgeReplies)
-		if len(toolCalls) == 0 {
-			toolCalls = filterToolCalls(res.ToolCalls, allowedTools, choiceMode, choiceName, parallelTools)
-		}
-		if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no text or tool calls")
-			return
-		}
-		message := map[string]any{"role": "assistant"}
-		if strings.TrimSpace(text) == "" {
-			message["content"] = nil
-		} else {
-			message["content"] = text
-		}
-		if len(toolCalls) > 0 {
-			message["tool_calls"] = toolCalls
-		}
-		finish := "stop"
-		if len(bridgeReplies) > 0 || (strings.TrimSpace(text) == "" && len(toolCalls) > 0) {
-			finish = "tool_calls"
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"id":      id,
-			"object":  "chat.completion",
-			"created": created,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index":         0,
-				"message":       message,
-				"finish_reason": finish,
-			}},
-			"usage": usageMap(res.Usage),
-		})
-		return
-	}
-
 	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if req.Stream && !ok {
 		writeOpenAIError(w, http.StatusInternalServerError, "streaming_unavailable", "response writer does not support flushing")
 		return
 	}
@@ -278,64 +204,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sawText := false
-	sawTool := false
-	var bridgeBuffer strings.Builder
-	toolIndex := 0
-	toolIndexes := make(map[string]int)
-	sentArgs := make(map[string]string)
-	emitTool := func(tc ToolCallState) {
-		if !toolAllowed(tc, allowedTools, choiceMode, choiceName) {
-			return
-		}
-		idx, seen := toolIndexes[tc.ID]
-		if !seen {
-			if !parallelTools && sawTool {
-				return
-			}
-			idx = toolIndex
-			toolIndex++
-			toolIndexes[tc.ID] = idx
-			args := strings.TrimSpace(tc.Arguments)
-			if args == "" {
-				args = "{}"
-			}
-			sentArgs[tc.ID] = args
-			writeChunk(map[string]any{"tool_calls": []map[string]any{{
-				"index": idx,
-				"id":    tc.ID,
-				"type":  "function",
-				"function": map[string]any{
-					"name":      tc.Name,
-					"arguments": args,
-				},
-			}}}, nil)
-			sawTool = true
-			return
-		}
-		args := strings.TrimSpace(tc.Arguments)
-		if args == "" {
-			args = "{}"
-		}
-		prev := sentArgs[tc.ID]
-		if args == prev {
-			return
-		}
-		delta := args
-		if strings.HasPrefix(args, prev) {
-			delta = args[len(prev):]
-		}
-		sentArgs[tc.ID] = args
-		if delta == "" {
-			return
-		}
-		writeChunk(map[string]any{"tool_calls": []map[string]any{{
-			"index":    idx,
-			"function": map[string]any{"arguments": delta},
-		}}}, nil)
-		sawTool = true
-	}
-
 	var res ChatResult
+	var sess *Session
 	var lastErr error
 	for range s.maxAttempts(ctx) {
 		acct, err := s.accounts.Next(ctx)
@@ -343,31 +213,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			lastErr = err
 			break
 		}
-		sess := SessionFromAccount(acct, s.cfg)
+		sess = SessionFromAccount(acct, s.cfg)
 		if err := sess.validate(); err != nil {
 			s.accounts.ReportFailure(ctx, acct.ID, err)
 			lastErr = err
 			continue
 		}
-		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
-			switch ev.Type {
-			case "text":
-				if ev.Text == "" {
-					return nil
-				}
-				if bridgeActive {
-					bridgeBuffer.WriteString(ev.Text)
-					return nil
-				}
+		res, err = s.chat(ctx, sess, in, func(ev StreamEvent) error {
+			if req.Stream && !bridgeActive && ev.Type == "text" && ev.Text != "" {
 				sawText = true
 				writeChunk(map[string]any{"content": ev.Text}, nil)
-			case "tool_call", "tool_call_update":
-				if bridgeActive {
-					return nil
-				}
-				if ev.ToolCall != nil {
-					emitTool(*ev.ToolCall)
-				}
 			}
 			return nil
 		})
@@ -383,11 +238,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Nothing reached the client yet; reset per-attempt state and try
 		// the next account in rotation.
 		sawText = false
-		sawTool = false
-		bridgeBuffer.Reset()
-		toolIndex = 0
-		toolIndexes = make(map[string]int)
-		sentArgs = make(map[string]string)
 	}
 	if lastErr != nil {
 		if !started {
@@ -403,60 +253,81 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	if bridgeActive {
-		text, replies := parseClientToolCalls(bridgeBuffer.String(), bridgeAllowed)
-		if !parallelTools && len(replies) > 1 {
-			replies = replies[:1]
+	text, calls, err := resolveToolCalls(res, bridgeAllowed, choiceMode, choiceName, parallelTools)
+	if errors.Is(err, errToolMarker) && ctx.Err() == nil {
+		// Reformat only the rejected response. Replaying the user's full task
+		// could repeat upstream actions or change the intended invocation.
+		log.Printf("client tool call needs repair: %v", err)
+		repair := ChatInput{
+			Model: model, Title: "Format client tool call",
+			SystemPrompt: systemPromptText + "\n\nReformat the supplied draft as client tool calls. Preserve the intended arguments. If a required value is missing and cannot be recovered, report failure. Do not execute the task.",
+			Prompt:       bridgePrompt + "\n\nReturn the corrected tool call(s) for this rejected draft. Keep the original tool and all parameter values. Use the declared tool names and complete JSON object arguments.\n" + res.Text,
 		}
-		if len(replies) > 0 {
-			if strings.TrimSpace(text) != "" {
-				writeChunk(map[string]any{"content": text}, nil)
-			}
-			for i, reply := range replies {
-				writeChunk(map[string]any{"tool_calls": []map[string]any{{
-					"index": i,
-					"id":    reply.ID,
-					"type":  "function",
-					"function": map[string]any{
-						"name":      reply.Name,
-						"arguments": reply.Arguments,
-					},
-				}}}, nil)
-			}
-			writeChunk(map[string]any{}, "tool_calls")
-		} else {
-			if strings.TrimSpace(text) == "" {
-				writeStreamError("upstream returned no text or tool calls")
-				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return
-			}
-			writeChunk(map[string]any{"content": text}, nil)
-			writeChunk(map[string]any{}, "stop")
+		fixed, repairErr := s.chat(ctx, sess, repair, nil)
+		if repairErr != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", repairErr.Error())
+			return
 		}
-		if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-			writePayload(map[string]any{
-				"id":      id,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   model,
-				"choices": []any{},
-				"usage":   usageMap(res.Usage),
-			})
+		res.Usage.add(fixed.Usage)
+		text, calls, err = resolveToolCalls(fixed, bridgeAllowed, choiceMode, choiceName, parallelTools)
+		if err == nil && len(calls) == 0 {
+			err = fmt.Errorf("%w: repair produced no tool call", errToolMarker)
 		}
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+	}
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "invalid_tool_call", err.Error())
 		return
 	}
-	if !sawText && !sawTool {
+	if !req.Stream {
+		if strings.TrimSpace(text) == "" && len(calls) == 0 {
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no text or tool calls")
+			return
+		}
+		message := map[string]any{"role": "assistant"}
+		if strings.TrimSpace(text) == "" {
+			message["content"] = nil
+		} else {
+			message["content"] = text
+		}
+		if len(calls) > 0 {
+			message["tool_calls"] = calls
+		}
+		finish := "stop"
+		if len(calls) > 0 {
+			finish = "tool_calls"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      id,
+			"object":  "chat.completion",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       message,
+				"finish_reason": finish,
+			}},
+			"usage": usageMap(res.Usage),
+		})
+		return
+	}
+	finish := "stop"
+	if bridgeActive {
+		if strings.TrimSpace(text) != "" {
+			sawText = true
+			writeChunk(map[string]any{"content": text}, nil)
+		}
+		for i, call := range calls {
+			writeChunk(map[string]any{"tool_calls": []map[string]any{{
+				"index": i, "id": call.ID, "type": call.Type, "function": call.Function,
+			}}}, nil)
+			finish = "tool_calls"
+		}
+	}
+	if !sawText && finish == "stop" {
 		writeStreamError("upstream returned no text or tool calls")
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
-	}
-	finish := "stop"
-	if !sawText && sawTool {
-		finish = "tool_calls"
 	}
 	writeChunk(map[string]any{}, finish)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
