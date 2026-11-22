@@ -31,6 +31,8 @@ func NewUpstream(cfg *config.Config) *Upstream {
 
 // ChatInput is one upstream turn.
 type ChatInput struct {
+	Messages     []Message
+	PromptPrefix string
 	Prompt       string
 	Model        string
 	ThreadID     string
@@ -93,8 +95,10 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	if title == "" {
 		title = titleFor(in.Prompt)
 	}
-	messageID := uuid()
-	traceID := uuid()
+	frame, err := u.userMessage(sess, in, threadID)
+	if err != nil {
+		return ChatResult{}, err
+	}
 
 	wsURL, headers, gateway, err := u.dialInfo(sess)
 	if err != nil {
@@ -187,15 +191,31 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		"payload": map[string]any{"session_id": threadID, "title": title},
 	})
 
+	if err := send(frame); err != nil {
+		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
+	}
+
+	result, err := u.readEvents(ctx, conn, gateway, onEvent)
+	if err != nil {
+		return result, err
+	}
+
+	if !u.cfg.KeepSessions {
+		_ = send(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
+	}
+	return result, nil
+}
+
+func (u *Upstream) userMessage(sess *Session, in ChatInput, threadID string) (map[string]any, error) {
 	payload := map[string]any{
-		"text":               in.Prompt,
+		"text":               "",
 		"send_origin":        "programmatic",
 		"had_physical_input": false,
 		"surfaceType":        sess.Surface,
 		"outpostId":          sess.OutpostID,
 		"appVersion":         u.cfg.AppVersion,
-		"traceId":            traceID,
-		"message_id":         messageID,
+		"traceId":            uuid(),
+		"message_id":         uuid(),
 		"thread_id":          threadID,
 		"agent_mode":         in.Model,
 		"user_timezone":      u.cfg.Timezone,
@@ -217,19 +237,18 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	if u.cfg.ThinkingEffort != "" && u.cfg.ThinkingEffort != "off" {
 		payload["thinking_effort"] = u.cfg.ThinkingEffort
 	}
-	if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
-		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
-	}
-
-	result, err := u.readEvents(ctx, conn, gateway, onEvent)
+	// The service limits the decoded JSON frame, before transport wrapping.
+	frame := map[string]any{"type": "user_message", "payload": payload}
+	emptyFrame, err := json.Marshal(frame)
 	if err != nil {
-		return result, err
+		return nil, err
 	}
-
-	if !u.cfg.KeepSessions {
-		_ = send(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
+	prompt, err := fitPrompt(in, maxUserFrameBytes-len(emptyFrame))
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	payload["text"] = prompt
+	return frame, nil
 }
 
 func (u *Upstream) dialInfo(sess *Session) (wsURL string, headers http.Header, gateway bool, err error) {
@@ -430,6 +449,8 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			MessageID string          `json:"message_id"`
 			Error     string          `json:"error"`
 			ErrorCode string          `json:"error_code"`
+			Code      string          `json:"code"`
+			Message   string          `json:"message"`
 		}
 		if err := json.Unmarshal([]byte(jsonStr), &env); err != nil {
 			continue
@@ -697,7 +718,17 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			}
 		case "error", "session_error", "stream_error", "turn_failed":
 			res, _ := finish()
-			return res, fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, env.Error, env.ErrorCode))
+			if env.Code == "FrameTooLarge" {
+				return res, errFrameTooLarge
+			}
+			detail := errorText(env.Payload, env.Error, env.ErrorCode)
+			if env.Message != "" {
+				detail = env.Message
+			}
+			if env.Code != "" {
+				detail = env.Code + ": " + detail
+			}
+			return res, fmt.Errorf("upstream %s: %s", env.Type, detail)
 		default:
 			if terminal[env.Type] {
 				return finish()

@@ -121,7 +121,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Smart can consult its own workspace when the client catalog appears
 		// only in system_prompt. Carry the catalog with the actual turn.
 		systemPromptText += "\n\nThe client tool catalog and its wire format appear at the start of this turn. Use that protocol to send tool calls to the client through this relay."
-		prompt = bridgePrompt + "\n\n" + prompt
+		bridgePrompt += "\n\n"
+		prompt = bridgePrompt + prompt
 	}
 	bridgeAllowed := allowedTools
 	if choiceMode == "function" && choiceName != "" {
@@ -135,6 +136,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	id := "chatcmpl-" + strings.ReplaceAll(uuid(), "-", "")
 	created := time.Now().Unix()
 	in := ChatInput{
+		Messages: req.Messages, PromptPrefix: bridgePrompt,
 		Prompt:       prompt,
 		Model:        model,
 		ThreadID:     threadID,
@@ -231,6 +233,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		lastErr = err
+		if errors.Is(err, errFrameTooLarge) {
+			break
+		}
 		s.accounts.ReportFailure(ctx, acct.ID, err)
 		if started || ctx.Err() != nil {
 			break
@@ -242,6 +247,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if lastErr != nil {
 		if !started {
 			status, code := http.StatusBadGateway, "upstream_error"
+			if errors.Is(lastErr, errFrameTooLarge) {
+				status, code = http.StatusRequestEntityTooLarge, "context_length_exceeded"
+			}
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			}
@@ -264,6 +272,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Prompt:       bridgePrompt + "\n\nReturn the corrected tool call(s) for this rejected draft. Keep the original tool and all parameter values. Use the declared tool names and complete JSON object arguments.\n" + rawArgumentRepair + "\n\nRejected draft:\n" + res.Text,
 		}
 		fixed, repairErr := s.chat(ctx, sess, repair, nil)
+		if errors.Is(repairErr, errFrameTooLarge) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "context_length_exceeded", repairErr.Error())
+			return
+		}
 		if repairErr != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", repairErr.Error())
 			return

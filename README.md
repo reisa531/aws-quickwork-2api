@@ -265,6 +265,7 @@ sequenceDiagram
 - 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果，供上游继续推理。
 - 客户端通过 `tools` / `functions` 声明的工具目录与调用格式放在当前轮次文本开头。`system_prompt` 中附有使用该协议的说明。模型用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 请求客户端执行工具。
 - 客户端执行后，把结果作为 `role: tool` 消息发回，模型可以继续调用工具或回答。
+- QuickWork 单条 `user_message` 上限为 64 KiB。代理按整帧 JSON 的字节数检查。超限时，先节选历史工具结果，必要时再节选历史助手输出和调用参数，用标记说明中间内容已省略。用户指令、系统指令和工具目录保留完整，客户端仍保存原始历史。
 - 有客户端工具时，流式响应会缓冲到本轮结束。流式和非流式都优先解析文本中的工具调用，再回退到名称匹配的上游原生事件。只要返回了工具调用，`finish_reason` 就是 `tool_calls`。
 - 调用末尾只缺结束标记时，代理直接读取完整的 JSON。标记中的调用无法解析时，代理会在同一个 HTTP 请求内，让同一账号和模型根据工具目录修正一次失败的输出。修正后的调用仍无效时，客户端会收到 HTTP 502 和 `invalid_tool_call`。
 - `tool_choice: "none"` 关闭工具桥接。指定函数时，代理只接受该函数，指定未声明的函数会返回 HTTP 400。
@@ -299,6 +300,7 @@ sequenceDiagram
 | 浏览器登录后一直等待 | 确认浏览器与命令在同一台机器，且回调端口可达；远程服务器请用 `login -manual` |
 | 服务器上 `localhost:18080` 回调打不开 | 这是预期现象；用 `login -manual`，复制浏览器地址栏的完整 URL 回填 |
 | `upstream_session_unavailable` / `no accounts configured` | 运行 `quickproxy login` |
+| `413 context_length_exceeded` | 自动节选历史后仍超出单帧限制。缩短本轮输入、系统指令或工具目录，必要时分次读取资料。 |
 | `401 invalid_api_key` | 检查 `config.json` 的 `api_keys` 与请求头中的 key 是否一致 |
 | 登录页面报错 | 查看终端输出的错误；确认 `-provider` 与账号类型匹配 |
 | 多账号请求总是失败 | 运行 `quickproxy accounts` 查看 `last_error`；对失效账号重新 `login` 或 `logout -account ID` |
